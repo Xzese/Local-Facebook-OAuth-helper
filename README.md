@@ -1,5 +1,11 @@
 # FB_Graph_Local_Auth
 
+<p align="center">
+  <a href="https://github.com/Xzese/FB_Graph_Local_Auth/stargazers"><img src="https://img.shields.io/github/stars/Xzese/FB_Graph_Local_Auth?style=flat-square" alt="Stars"></a>
+  <a href="https://github.com/Xzese/FB_Graph_Local_Auth/commits/main"><img src="https://img.shields.io/github/last-commit/Xzese/FB_Graph_Local_Auth?style=flat-square" alt="Last commit"></a>
+  <a href="https://github.com/Xzese/FB_Graph_Local_Auth"><img src="https://img.shields.io/github/languages/top/Xzese/FB_Graph_Local_Auth?style=flat-square" alt="Top language"></a>
+</p>
+
 This repository contains code to make an authentication server using the Facebook Graph API for local authentication on a device or local network. This functionality was originally part of the [Smart Display App](https://github.com/yourusername/Smart-Display-App), but has been moved into a standalone repository.
 
 ## Setting Up the Authentication Server

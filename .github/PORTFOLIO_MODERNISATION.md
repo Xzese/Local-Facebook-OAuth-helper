@@ -1,21 +1,21 @@
 # OAuth lifecycle modernisation
 
-Placeholder for strengthening the local Facebook/Instagram OAuth helper while keeping it focused.
+Status: implementation started. Keep the PR in draft.
 
-## Scope
-- Represent authentication attempts and outcomes explicitly: success, denial, cancellation, timeout and failure.
-- Add bounded attempt lifetimes instead of allowing indefinite waits.
-- Start and verify the callback listener before opening the browser or exposing the authentication URL.
-- Make shutdown and cancellation deterministic.
-- Put token persistence behind an explicit storage interface rather than inferred parent-project .env paths.
-- Make listener/redirect configuration explicit for local-browser and LAN/QR workflows.
-- Retain and test OAuth state generation and comparison.
-- Add tests for state mismatch, repeated callbacks, expiry, denial, occupied ports and cancellation.
-- Review current Meta OAuth/Graph API compatibility before changing protocol behaviour.
-- Coordinate any breaking changes with pinned Smart Display and Instagram publishing consumers.
-- Update README setup and lifecycle documentation.
+## Implemented
+- Explicit pending, exchanging, succeeded, denied, cancelled, timed-out and failed outcomes.
+- Monotonic attempt deadline and one-time state claim protected by a lock.
+- Cancellation and expiry prevent a late exchange from persisting credentials.
+- Listener-ready signal before the browser opens.
+- Threaded listener and deterministic cleanup of the waiter.
+- Explicit TOKEN_ENV_PATH override and atomic token/expiry file replacement.
+- Configurable Graph API version; no unverified current-version default.
+- Fourteen isolated tests passed; auth_server.py compiles.
 
-## Portfolio outcome
-Present this either as a focused, well-tested local OAuth utility or as a clearly documented earlier implementation after consumers migrate elsewhere.
+## Validation limits
 
-No implementation is included in this placeholder PR.
+The HTTP callback test module was skipped locally because Flask was absent. Live Meta, TLS, socket lifecycle and browser/QR flows were not tested.
+
+## Remaining
+
+Complete integration tests, storage abstraction, log redaction and listener/redirect policy. Verify Meta compatibility. Add packaging and CI. Update each pinned consumer only after it handles explicit outcomes correctly. The legacy inferred token-file location remains a documented migration fallback.

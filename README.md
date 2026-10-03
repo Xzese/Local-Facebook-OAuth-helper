@@ -1,43 +1,38 @@
-# FB_Graph_Local_Auth
+# Local Facebook OAuth helper
 
-<p align="center">
-  <a href="https://github.com/Xzese/FB_Graph_Local_Auth/stargazers"><img src="https://img.shields.io/github/stars/Xzese/FB_Graph_Local_Auth?style=flat-square" alt="Stars"></a>
-  <a href="https://github.com/Xzese/FB_Graph_Local_Auth/commits/main"><img src="https://img.shields.io/github/last-commit/Xzese/FB_Graph_Local_Auth?style=flat-square" alt="Last commit"></a>
-  <a href="https://github.com/Xzese/FB_Graph_Local_Auth"><img src="https://img.shields.io/github/languages/top/Xzese/FB_Graph_Local_Auth?style=flat-square" alt="Top language"></a>
-</p>
+A local callback server for operator-owned Facebook/Instagram integrations. This branch contains the first OAuth lifecycle implementation. Keep the PR in draft until HTTP, listener and live-provider checks are complete.
 
-This repository contains code to make an authentication server using the Facebook Graph API for local authentication on a device or local network. This functionality was originally part of the [Smart Display App](https://github.com/yourusername/Smart-Display-App), but has been moved into a standalone repository.
+## Setup
 
-## Setting Up the Authentication Server
+Use Python 3.11 or later. Install requirements.txt and copy .env.example to .env. Configure your own Meta application, permissions and supported GRAPH_API_VERSION. The callback URI is exactly `https://<CLIENT_IP_ADDRESS>:5000/callback`.
 
-### Creating the Facebook Development App
+The listener uses an ad-hoc certificate and retains the existing local/LAN model. It is not a public production authentication service. A QR flow on another device requires an address reachable from that device, not its loopback address. Verify Meta redirect and certificate requirements before use.
 
-1. Go to the [Facebook Developer Dashboard](https://developers.facebook.com/) and log in with your Facebook account.
-2. Click on "My Apps" and then "Create App".
-3. Choose the "Business" category and click "Next".
-4. Fill in the required fields such as the app name, email address, and select a Business Manager account if applicable. Click "Create App".
-5. Once the app is created, navigate to the app dashboard.
-6. In the app dashboard, navigate to the "Products" section.
-7. Click on "Add a Product" and select "Facebook Login".
-8. Follow the prompts to configure Facebook Login for your app.
-9. After configuring Facebook Login, repeat step 7 and select "Instagram Graph API".
-10. Follow the prompts to configure Instagram Graph API for your app.
-11. Navigate to the "Settings" tab in the app dashboard.
-12. In the "Basic" settings, add the app domain (in the format `127.0.0.1`) in the "App Domains" field. This will whitelist the redirect URIs.
-13. In the "Facebook Login" settings, add the client local IP address (in the format `https://127.0.0.1/callback`) to the "Valid OAuth Redirect URIs".
-14. Save your changes.
+## Authentication lifecycle
 
-### Setting Environment Variables
+```python
+from auth_server import get_auth_url, local_browser_capture, wait_for_token
+from oauth_attempt import Outcome
 
-1. Create a `.env` file in the project directory.
-2. Set the following environment variables in the `.env` file:
-   - `APP_ID`: The App ID obtained from the Facebook Developer Dashboard.
-   - `APP_SECRET`: The App Secret obtained from the Facebook Developer Dashboard.
-   - `GRAPH_SCOPE`: Comma-separated Facebook permissions requested during OAuth (for example `instagram_basic,pages_show_list,business_management`).
-   - `CLIENT_IP_ADDRESS`: The local IP address of the device where the application will run. This can be either `192.168.x.y`, `localhost`, or `127.0.0.1`.
+url = get_auth_url(timeout=180)
+local_browser_capture(url)
+outcome = wait_for_token()
+if outcome == Outcome.SUCCEEDED:
+    print("Authentication completed")
+else:
+    print("Authentication did not complete:", outcome.value)
+```
 
-Ensure that the `.env` file contains these variables with their respective values before running the application. These variables are necessary for the application to communicate with the Facebook Graph API services.
+The browser thread waits for listener readiness. Each attempt has a monotonic deadline and one claimable OAuth state. A repeated, cancelled or expired callback cannot persist a token. Denial, cancellation, timeout and failure are distinct terminal results. Shutdown releases the waiting caller.
 
-### Generating the Authentication URL
+When importing as a package, use the corresponding package imports. Existing function names remain, but callers must now inspect the returned Outcome. Do not treat any completed thread as successful authentication.
 
-The authentication server includes a function `get_auth_url()` that uses the environment variables to get the authentication URL from the Facebook Graph API. By default, if you run the code as the main module, it will open up the local browser to start the authentication process.
+Set TOKEN_ENV_PATH explicitly when embedding. The previous inferred .env location remains a fallback until consumers migrate. Token and expiry are written together through a restricted temporary file and atomic replacement. This is a local storage implementation, not cross-process file locking or a keychain integration.
+
+## Validation
+
+Fourteen isolated lifecycle tests passed. The callback test module was skipped locally because Flask was not installed. Python syntax compilation passed. Run `python -m pytest -q tests` after installing all requirements to execute the callback tests too. No live authentication was performed.
+
+## Remaining work
+
+Complete listener/socket and callback tests, log redaction, configurable TLS/redirect handling, packaging and CI. Review the actual Meta flow and expiry semantics with a test application. Update Smart Display's result handling before changing its auth submodule pin. Do not archive this helper or change consumer pins as part of this first pass.

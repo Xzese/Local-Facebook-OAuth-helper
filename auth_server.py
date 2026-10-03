@@ -26,6 +26,11 @@ _attempt = None
 _auth_url = None
 _server_running = False
 token_thread = None
+token_acquired = threading.Event()
+pending_oauth_state = None
+pending_auth_url = None
+
+DEFAULT_GRAPH_API_VERSION = "v26.0"
 
 
 def get_env_path():
@@ -35,6 +40,10 @@ def get_env_path():
     return str((root if __name__ == "__main__" else root.parent) / ".env")
 
 
+# Parent applications historically receive their configuration during import.
+dotenv.load_dotenv(get_env_path())
+
+
 def _required(name):
     value = os.getenv(name, "").strip()
     if not value:
@@ -42,11 +51,16 @@ def _required(name):
     return value
 
 
-def _graph_version():
-    version = _required("GRAPH_API_VERSION")
+def get_graph_api_version():
+    """Use a supported default without requiring changes to existing .env files."""
+    version = os.getenv("GRAPH_API_VERSION", "").strip() or DEFAULT_GRAPH_API_VERSION
     if not re.fullmatch(r"v[1-9][0-9]*\.[0-9]+", version):
         raise RuntimeError("GRAPH_API_VERSION must have the form vNN.N.")
     return version
+
+
+def _graph_version():
+    return get_graph_api_version()
 
 
 def _redirect_uri():
@@ -54,7 +68,7 @@ def _redirect_uri():
 
 
 def get_auth_url(force_new=False, timeout=180.0):
-    global _attempt, _auth_url
+    global _attempt, _auth_url, pending_oauth_state, pending_auth_url
     with oauth_state_lock:
         if not force_new and _attempt is not None and _attempt.outcome in {Outcome.PENDING, Outcome.EXCHANGING}:
             return _auth_url
@@ -66,8 +80,11 @@ def get_auth_url(force_new=False, timeout=180.0):
         if _attempt is not None:
             _attempt.finish(Outcome.CANCELLED)
         _attempt = OAuthAttempt(timeout)
+        token_acquired.clear()
         params["state"] = _attempt.state
         _auth_url = f"https://www.facebook.com/{version}/dialog/oauth?" + urlencode(params)
+        pending_oauth_state = _attempt.state
+        pending_auth_url = _auth_url
         return _auth_url
 
 
@@ -85,6 +102,8 @@ def _expiry(payload, token):
     )
     response.raise_for_status()
     data = response.json()["data"]
+    if not isinstance(data, dict):
+        raise ValueError("Invalid token validation response.")
     if data.get("is_valid") is not True:
         raise ValueError("Token validation failed.")
     # Token expiry and data-access expiry are different. Do not substitute one.
@@ -94,8 +113,8 @@ def _expiry(payload, token):
     return expiry
 
 
-def exchange_code_for_token(code):
-    """Fetch and validate only. Persistence belongs to the active attempt."""
+def _fetch_token(code):
+    """Fetch and validate without persisting a cancelled callback's token."""
     try:
         response = requests.post(
             f"https://graph.facebook.com/{_graph_version()}/oauth/access_token",
@@ -105,12 +124,24 @@ def exchange_code_for_token(code):
         if response.status_code != 200:
             return None
         payload = response.json()
+        if not isinstance(payload, dict):
+            return None
         token = payload["access_token"]
         if not isinstance(token, str) or not token.strip():
             return None
-        return token, _expiry(payload, token)
-    except (requests.RequestException, ValueError, KeyError, TypeError, OverflowError, RuntimeError):
+        return payload, _expiry(payload, token)
+    except (requests.RequestException, ValueError, KeyError, TypeError, OverflowError, RuntimeError, OSError):
         return None
+
+
+def exchange_code_for_token(code):
+    """Legacy standalone exchange: save the token and return Meta's payload."""
+    result = _fetch_token(code)
+    if result is None:
+        return None
+    payload, expiry = result
+    _persist_token(payload["access_token"], expiry)
+    return payload
 
 
 def _persist_token(token, expiry):
@@ -145,21 +176,29 @@ def callback():
         return Response("Invalid, expired or already used OAuth state.", status=400, mimetype="text/plain")
     if request.args.get("error"):
         attempt.finish(Outcome.DENIED)
+        _clear_pending_oauth_attempt(attempt)
         return Response("Authorization was denied.", status=400, mimetype="text/plain")
     code = request.args.get("code")
     if not code:
         attempt.finish(Outcome.FAILED)
+        _clear_pending_oauth_attempt(attempt)
         return Response("Authorization code is missing.", status=400, mimetype="text/plain")
-    result = exchange_code_for_token(code)
+    result = _fetch_token(code)
     if result is None:
         attempt.finish(Outcome.FAILED)
+        _clear_pending_oauth_attempt(attempt)
         return Response("Token exchange failed. Start a new attempt.", status=502, mimetype="text/plain")
     try:
-        completed = attempt.complete(lambda: _persist_token(*result))
+        payload, expiry = result
+        completed = attempt.complete(lambda: _persist_token(payload["access_token"], expiry))
     except Exception:
         return Response("Token storage failed.", status=500, mimetype="text/plain")
     if not completed:
         return Response("Authorization was cancelled or expired.", status=409, mimetype="text/plain")
+    with oauth_state_lock:
+        if _attempt is attempt:
+            token_acquired.set()
+            _clear_pending_oauth_attempt(attempt)
     return Response("Authorization completed. You can close this window.", mimetype="text/plain")
 
 
@@ -190,12 +229,18 @@ def wait_for_token():
         return attempt.finish(Outcome.FAILED)
     finally:
         listener_ready.clear()
+        _clear_pending_oauth_attempt(attempt)
         if server is not None:
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
         with oauth_state_lock:
             _server_running = False
+
+
+def open_webbrowser(auth_url):
+    """Retain the original public browser helper."""
+    return webbrowser.open(auth_url, new=1, autoraise=True)
 
 
 def local_browser_capture(auth_url=None):
@@ -205,16 +250,27 @@ def local_browser_capture(auth_url=None):
         attempt = _attempt
     def open_when_ready():
         if listener_ready.wait(timeout=10) and attempt is not None and attempt.outcome == Outcome.PENDING:
-            webbrowser.open(url, new=1, autoraise=True)
+            open_webbrowser(url)
     token_thread = threading.Thread(target=open_when_ready, daemon=True)
     token_thread.start()
     return token_thread
+
+
+def _clear_pending_oauth_attempt(attempt=None):
+    global pending_oauth_state, pending_auth_url
+    with oauth_state_lock:
+        if attempt is not None and attempt is not _attempt:
+            return
+        pending_oauth_state = None
+        pending_auth_url = None
 
 
 def stop_server():
     with oauth_state_lock:
         if _attempt is not None:
             _attempt.finish(Outcome.CANCELLED)
+        _clear_pending_oauth_attempt()
+        token_acquired.set()
     listener_ready.clear()
 
 

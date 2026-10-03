@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-
+"""Local OAuth callback server with explicit, bounded authentication outcomes."""
 import datetime
 import os
-import secrets
+from pathlib import Path
+import re
+import tempfile
 import threading
 import webbrowser
 from urllib.parse import urlencode
@@ -12,405 +14,267 @@ import requests
 from flask import Flask, Response, request
 from werkzeug.serving import make_server
 
+if __package__:
+    from .oauth_attempt import OAuthAttempt, Outcome
+else:
+    from oauth_attempt import OAuthAttempt, Outcome
 
 app = Flask(__name__)
-
-
-def get_env_path():
-    """
-    Return the location of the .env file.
-
-    When run directly, the .env file is expected beside this script.
-    When imported as a submodule, the .env file is expected in the
-    parent project directory.
-    """
-    if __name__ == "__main__":
-        return os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            ".env",
-        )
-
-    return os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        ".env",
-    )
-
-
-dotenv.load_dotenv(get_env_path())
-
-
-token_acquired = threading.Event()
+oauth_state_lock = threading.RLock()
+listener_ready = threading.Event()
+_attempt = None
+_auth_url = None
+_server_running = False
 token_thread = None
-
-# Details for the currently active OAuth attempt.
+token_acquired = threading.Event()
 pending_oauth_state = None
 pending_auth_url = None
 
-# Protect the pending OAuth state in case functions are called from
-# different application and Flask server threads.
-oauth_state_lock = threading.RLock()
+DEFAULT_GRAPH_API_VERSION = "v26.0"
 
 
-def _get_required_environment_variable(name):
-    value = os.getenv(name)
-
-    if value is None or not value.strip():
-        raise RuntimeError(
-            f"Required environment variable {name} is not configured."
-        )
-
-    return value.strip()
+def get_env_path():
+    if os.getenv("TOKEN_ENV_PATH"):
+        return os.path.abspath(os.environ["TOKEN_ENV_PATH"])
+    root = Path(__file__).resolve().parent
+    return str((root if __name__ == "__main__" else root.parent) / ".env")
 
 
-def _clear_pending_oauth_attempt():
-    global pending_oauth_state
-    global pending_auth_url
+# Parent applications historically receive their configuration during import.
+dotenv.load_dotenv(get_env_path())
 
+
+def _required(name):
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} is required.")
+    return value
+
+
+def get_graph_api_version():
+    """Use a supported default without requiring changes to existing .env files."""
+    version = os.getenv("GRAPH_API_VERSION", "").strip() or DEFAULT_GRAPH_API_VERSION
+    if not re.fullmatch(r"v[1-9][0-9]*\.[0-9]+", version):
+        raise RuntimeError("GRAPH_API_VERSION must have the form vNN.N.")
+    return version
+
+
+def _graph_version():
+    return get_graph_api_version()
+
+
+def _redirect_uri():
+    return f"https://{_required('CLIENT_IP_ADDRESS')}:5000/callback"
+
+
+def get_auth_url(force_new=False, timeout=180.0):
+    global _attempt, _auth_url, pending_oauth_state, pending_auth_url
     with oauth_state_lock:
-        pending_oauth_state = None
-        pending_auth_url = None
+        if not force_new and _attempt is not None and _attempt.outcome in {Outcome.PENDING, Outcome.EXCHANGING}:
+            return _auth_url
+        if _server_running:
+            raise RuntimeError("Stop the active listener before starting a new OAuth attempt.")
+        dotenv.load_dotenv(get_env_path())
+        params = {"client_id": _required("APP_ID"), "redirect_uri": _redirect_uri(), "scope": _required("GRAPH_SCOPE"), "response_type": "code"}
+        version = _graph_version()
+        if _attempt is not None:
+            _attempt.finish(Outcome.CANCELLED)
+        _attempt = OAuthAttempt(timeout)
+        token_acquired.clear()
+        params["state"] = _attempt.state
+        _auth_url = f"https://www.facebook.com/{version}/dialog/oauth?" + urlencode(params)
+        pending_oauth_state = _attempt.state
+        pending_auth_url = _auth_url
+        return _auth_url
+
+
+def _expiry(payload, token):
+    seconds = payload.get("expires_in")
+    if seconds is not None:
+        seconds = int(seconds)
+        if seconds <= 0:
+            raise ValueError("Invalid token lifetime.")
+        return datetime.datetime.now() + datetime.timedelta(seconds=seconds)
+    response = requests.get(
+        f"https://graph.facebook.com/{_graph_version()}/debug_token",
+        params={"input_token": token, "access_token": f"{_required('APP_ID')}|{_required('APP_SECRET')}"},
+        timeout=(5, 30), allow_redirects=False,
+    )
+    response.raise_for_status()
+    data = response.json()["data"]
+    if not isinstance(data, dict):
+        raise ValueError("Invalid token validation response.")
+    if data.get("is_valid") is not True:
+        raise ValueError("Token validation failed.")
+    # Token expiry and data-access expiry are different. Do not substitute one.
+    expiry = datetime.datetime.fromtimestamp(int(data["expires_at"]))
+    if expiry <= datetime.datetime.now():
+        raise ValueError("Token expiry is not in the future.")
+    return expiry
+
+
+def _fetch_token(code):
+    """Fetch and validate without persisting a cancelled callback's token."""
+    try:
+        response = requests.post(
+            f"https://graph.facebook.com/{_graph_version()}/oauth/access_token",
+            data={"client_id": _required("APP_ID"), "client_secret": _required("APP_SECRET"), "grant_type": "authorization_code", "redirect_uri": _redirect_uri(), "code": code},
+            timeout=(5, 30), allow_redirects=False,
+        )
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return None
+        token = payload["access_token"]
+        if not isinstance(token, str) or not token.strip():
+            return None
+        return payload, _expiry(payload, token)
+    except (requests.RequestException, ValueError, KeyError, TypeError, OverflowError, RuntimeError, OSError):
+        return None
+
+
+def exchange_code_for_token(code):
+    """Legacy standalone exchange: save the token and return Meta's payload."""
+    result = _fetch_token(code)
+    if result is None:
+        return None
+    payload, expiry = result
+    _persist_token(payload["access_token"], expiry)
+    return payload
+
+
+def _persist_token(token, expiry):
+    path = Path(get_env_path())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    expiry_text = expiry.strftime("%Y-%m-%d %H:%M:%S.%f")
+    fd, temporary = tempfile.mkstemp(prefix=".oauth-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(path.read_text(encoding="utf-8") if path.exists() else "")
+        dotenv.set_key(temporary, "ACCESS_TOKEN", token)
+        dotenv.set_key(temporary, "ACCESS_TOKEN_EXPIRY", expiry_text)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        os.environ["ACCESS_TOKEN"] = token
+        os.environ["ACCESS_TOKEN_EXPIRY"] = expiry_text
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 @app.route("/")
 def index():
-    return Response(
-        "Authorization server is running",
-        status=200,
-        mimetype="text/plain",
-    )
+    return Response("Authorization listener is running.", mimetype="text/plain")
 
 
 @app.route("/callback")
 def callback():
-    state = request.args.get("state")
+    with oauth_state_lock:
+        attempt = _attempt
+    if attempt is None or not attempt.claim(request.args.get("state")):
+        return Response("Invalid, expired or already used OAuth state.", status=400, mimetype="text/plain")
+    if request.args.get("error"):
+        attempt.finish(Outcome.DENIED)
+        _clear_pending_oauth_attempt(attempt)
+        return Response("Authorization was denied.", status=400, mimetype="text/plain")
     code = request.args.get("code")
-
-    with oauth_state_lock:
-        expected_state = pending_oauth_state
-
-    if not state or not expected_state:
-        return Response(
-            "Error: Invalid or missing OAuth state",
-            status=400,
-            mimetype="text/plain",
-        )
-
-    if not secrets.compare_digest(state, expected_state):
-        return Response(
-            "Error: Invalid or missing OAuth state",
-            status=400,
-            mimetype="text/plain",
-        )
-
-    # Facebook may return an OAuth error instead of an authorization code.
-    oauth_error = request.args.get("error")
-
-    if oauth_error:
-        error_description = request.args.get(
-            "error_description",
-            oauth_error,
-        )
-
-        _clear_pending_oauth_attempt()
-
-        return Response(
-            f"Error: Facebook authorization failed: {error_description}",
-            status=400,
-            mimetype="text/plain",
-        )
-
     if not code:
-        _clear_pending_oauth_attempt()
-
-        return Response(
-            "Error: Authorization code not received",
-            status=400,
-            mimetype="text/plain",
-        )
-
-    token_response = exchange_code_for_token(code)
-
-    if token_response is None:
-        # Keep the current state and URL available so the user can reopen
-        # the same authorization URL and retry the flow.
-        return Response(
-            "Error: Failed to exchange authorization code for token",
-            status=502,
-            mimetype="text/plain",
-        )
-
-    _clear_pending_oauth_attempt()
-    token_acquired.set()
-
-    return Response(
-        "Token acquired, shutting down server...",
-        status=200,
-        mimetype="text/plain",
-    )
-
-
-def get_auth_url(force_new=False):
-    """
-    Return the URL for the current OAuth attempt.
-
-    Repeated calls return the same URL and state unless force_new=True.
-    This ensures a displayed QR code and a subsequently opened browser
-    use the same OAuth state.
-    """
-    global pending_oauth_state
-    global pending_auth_url
-
+        attempt.finish(Outcome.FAILED)
+        _clear_pending_oauth_attempt(attempt)
+        return Response("Authorization code is missing.", status=400, mimetype="text/plain")
+    result = _fetch_token(code)
+    if result is None:
+        attempt.finish(Outcome.FAILED)
+        _clear_pending_oauth_attempt(attempt)
+        return Response("Token exchange failed. Start a new attempt.", status=502, mimetype="text/plain")
+    try:
+        payload, expiry = result
+        completed = attempt.complete(lambda: _persist_token(payload["access_token"], expiry))
+    except Exception:
+        return Response("Token storage failed.", status=500, mimetype="text/plain")
+    if not completed:
+        return Response("Authorization was cancelled or expired.", status=409, mimetype="text/plain")
     with oauth_state_lock:
-        if (
-            not force_new
-            and pending_oauth_state is not None
-            and pending_auth_url is not None
-        ):
-            return pending_auth_url
-
-        app_id = _get_required_environment_variable("APP_ID")
-        client_ip_address = _get_required_environment_variable(
-            "CLIENT_IP_ADDRESS"
-        )
-        graph_scope = _get_required_environment_variable("GRAPH_SCOPE")
-
-        redirect_uri = (
-            f"https://{client_ip_address}:5000/callback"
-        )
-
-        pending_oauth_state = secrets.token_urlsafe(32)
-
-        params = {
-            "client_id": app_id,
-            "redirect_uri": redirect_uri,
-            "state": pending_oauth_state,
-            "scope": graph_scope,
-            "response_type": "code",
-        }
-
-        pending_auth_url = (
-            "https://www.facebook.com/v20.0/dialog/oauth?"
-            + urlencode(params)
-        )
-
-        return pending_auth_url
-
-
-def exchange_code_for_token(code):
-    app_id = _get_required_environment_variable("APP_ID")
-    app_secret = _get_required_environment_variable("APP_SECRET")
-    client_ip_address = _get_required_environment_variable(
-        "CLIENT_IP_ADDRESS"
-    )
-
-    endpoint_url = (
-        "https://graph.facebook.com/v20.0/oauth/access_token"
-    )
-
-    params = {
-        "client_id": app_id,
-        "client_secret": app_secret,
-        "grant_type": "authorization_code",
-        "redirect_uri": (
-            f"https://{client_ip_address}:5000/callback"
-        ),
-        "code": code,
-    }
-
-    try:
-        response = requests.post(
-            endpoint_url,
-            data=params,
-            timeout=30,
-        )
-    except requests.RequestException as error:
-        print(f"Token exchange request failed: {error}")
-        return None
-
-    if response.status_code != 200:
-        print(
-            "Token exchange failed with status "
-            f"{response.status_code}: {response.text}"
-        )
-        return None
-
-    try:
-        response_payload = response.json()
-    except ValueError:
-        print("Token exchange returned an invalid JSON response.")
-        return None
-
-    instagram_access_token = response_payload.get("access_token")
-
-    if not instagram_access_token:
-        print("Token exchange response did not include an access token.")
-        return None
-
-    expiry_date = _get_access_token_expiry(
-        response_payload=response_payload,
-        instagram_access_token=instagram_access_token,
-        app_id=app_id,
-        app_secret=app_secret,
-    )
-
-    if expiry_date is None:
-        print("Unable to determine the access-token expiry date.")
-        return None
-
-    expiry_date_string = str(expiry_date)
-
-    os.environ["ACCESS_TOKEN"] = instagram_access_token
-    os.environ["ACCESS_TOKEN_EXPIRY"] = expiry_date_string
-
-    dotenv.set_key(
-        get_env_path(),
-        "ACCESS_TOKEN",
-        instagram_access_token,
-    )
-    dotenv.set_key(
-        get_env_path(),
-        "ACCESS_TOKEN_EXPIRY",
-        expiry_date_string,
-    )
-
-    return response_payload
-
-
-def _get_access_token_expiry(
-    response_payload,
-    instagram_access_token,
-    app_id,
-    app_secret,
-):
-    expires_in = response_payload.get("expires_in")
-
-    if expires_in is not None:
-        try:
-            return datetime.datetime.now() + datetime.timedelta(
-                seconds=int(expires_in)
-            )
-        except (TypeError, ValueError):
-            print(
-                "Token response contained an invalid expires_in value."
-            )
-
-    debug_token_url = "https://graph.facebook.com/debug_token"
-
-    debug_token_params = {
-        "input_token": instagram_access_token,
-        "access_token": f"{app_id}|{app_secret}",
-    }
-
-    try:
-        debug_token_response = requests.get(
-            debug_token_url,
-            params=debug_token_params,
-            timeout=30,
-        )
-    except requests.RequestException as error:
-        print(f"Debug-token request failed: {error}")
-        return None
-
-    if debug_token_response.status_code != 200:
-        print(
-            "Debug-token request failed with status "
-            f"{debug_token_response.status_code}: "
-            f"{debug_token_response.text}"
-        )
-        return None
-
-    try:
-        debug_payload = debug_token_response.json()
-        expiry_timestamp = debug_payload["data"][
-            "data_access_expires_at"
-        ]
-        return datetime.datetime.fromtimestamp(
-            int(expiry_timestamp)
-        )
-    except (KeyError, TypeError, ValueError):
-        print(
-            "Debug-token response did not contain a valid "
-            "data_access_expires_at value."
-        )
-        return None
+        if _attempt is attempt:
+            token_acquired.set()
+            _clear_pending_oauth_attempt(attempt)
+    return Response("Authorization completed. You can close this window.", mimetype="text/plain")
 
 
 def run_server():
-    client_ip_address = _get_required_environment_variable(
-        "CLIENT_IP_ADDRESS"
-    )
-
-    print(client_ip_address)
-
-    server = make_server(
-        client_ip_address,
-        5000,
-        app,
-        ssl_context="adhoc",
-    )
-
-    server_thread = threading.Thread(
-        target=server.serve_forever,
-    )
-    server_thread.start()
-
-    return server, server_thread
-
-
-def open_webbrowser(auth_url):
-    webbrowser.open(
-        auth_url,
-        new=1,
-        autoraise=True,
-    )
+    server = make_server(_required("CLIENT_IP_ADDRESS"), 5000, app, threaded=True, ssl_context="adhoc")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    listener_ready.set()
+    return server, thread
 
 
 def wait_for_token():
-    global token_thread
-
-    token_acquired.clear()
-
-    server, server_thread = run_server()
-
+    global _server_running
+    with oauth_state_lock:
+        if _server_running:
+            raise RuntimeError("An OAuth listener is already active.")
+        if _attempt is None:
+            get_auth_url()
+        attempt = _attempt
+        if attempt.outcome not in {Outcome.PENDING, Outcome.EXCHANGING}:
+            return attempt.outcome
+        _server_running = True
+    server = thread = None
     try:
-        token_acquired.wait()
+        server, thread = run_server()
+        return attempt.wait()
+    except (Exception, SystemExit):
+        return attempt.finish(Outcome.FAILED)
     finally:
-        if (
-            token_thread is not None
-            and token_thread is not threading.current_thread()
-        ):
-            token_thread.join(timeout=5)
+        listener_ready.clear()
+        _clear_pending_oauth_attempt(attempt)
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        with oauth_state_lock:
+            _server_running = False
 
-        server.shutdown()
-        server_thread.join()
+
+def open_webbrowser(auth_url):
+    """Retain the original public browser helper."""
+    return webbrowser.open(auth_url, new=1, autoraise=True)
 
 
 def local_browser_capture(auth_url=None):
-    """
-    Open the current OAuth URL in the local browser.
-
-    auth_url remains optional for compatibility with existing callers.
-    When omitted, get_auth_url() returns the existing pending URL rather
-    than generating a different state.
-    """
     global token_thread
-
-    if auth_url is None:
-        auth_url = get_auth_url()
-
-    token_thread = threading.Thread(
-        target=open_webbrowser,
-        args=(auth_url,),
-    )
+    url = auth_url or get_auth_url()
+    with oauth_state_lock:
+        attempt = _attempt
+    def open_when_ready():
+        if listener_ready.wait(timeout=10) and attempt is not None and attempt.outcome == Outcome.PENDING:
+            open_webbrowser(url)
+    token_thread = threading.Thread(target=open_when_ready, daemon=True)
     token_thread.start()
+    return token_thread
+
+
+def _clear_pending_oauth_attempt(attempt=None):
+    global pending_oauth_state, pending_auth_url
+    with oauth_state_lock:
+        if attempt is not None and attempt is not _attempt:
+            return
+        pending_oauth_state = None
+        pending_auth_url = None
 
 
 def stop_server():
-    _clear_pending_oauth_attempt()
-    token_acquired.set()
+    with oauth_state_lock:
+        if _attempt is not None:
+            _attempt.finish(Outcome.CANCELLED)
+        _clear_pending_oauth_attempt()
+        token_acquired.set()
+    listener_ready.clear()
 
 
 if __name__ == "__main__":
     authorization_url = get_auth_url()
     local_browser_capture(authorization_url)
-    wait_for_token()
+    raise SystemExit(0 if wait_for_token() == Outcome.SUCCEEDED else 1)
